@@ -20,6 +20,7 @@ MODEL:
     # Please refer to https://github.com/yqyao/FCOS_PLUS
     CENTER_SAMPLING_RADIUS: 1.5
     IOU_LOSS_TYPE: "giou"
+    USE_NON_LOCAL: True
     NON_LOCAL:
       ON_CLS: True
       ON_REG: False

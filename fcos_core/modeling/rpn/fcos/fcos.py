@@ -128,7 +128,9 @@ class FCOSHead(torch.nn.Module):
         torch.nn.init.constant_(self.cls_logits.bias, bias_value)
 
         self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in range(5)])
-        self.non_local = NonLocalBlock(cfg, in_channels)
+
+        if cfg.MODEL.FCOS.USE_NON_LOCAL:
+            self.non_local = NonLocalBlock(cfg, in_channels)
 
     def forward(self, x):
         logits = []
