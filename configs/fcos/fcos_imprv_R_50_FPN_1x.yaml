@@ -20,6 +20,9 @@ MODEL:
     # Please refer to https://github.com/yqyao/FCOS_PLUS
     CENTER_SAMPLING_RADIUS: 1.5
     IOU_LOSS_TYPE: "giou"
+    NON_LOCAL:
+      ON_CLS: True
+      ON_REG: False
 DATASETS:
   TRAIN: ("coco_2014_train", "coco_2014_valminusminival")
   TEST: ("coco_2014_minival",)

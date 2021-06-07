@@ -312,6 +312,9 @@ _C.MODEL.FCOS.CENTERNESS_ON_REG = False
 
 _C.MODEL.FCOS.USE_DCN_IN_TOWER = False
 
+_C.MODEL.FCOS.NON_LOCAL = CN()
+_C.MODEL.FCOS.NON_LOCAL.ON_CLS = True
+_C.MODEL.FCOS.NON_LOCAL.ON_REG = False
 # ---------------------------------------------------------------------------- #
 # RetinaNet Options (Follow the Detectron version)
 # ---------------------------------------------------------------------------- #

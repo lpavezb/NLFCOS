@@ -10,6 +10,44 @@ from fcos_core.layers import Scale
 from fcos_core.layers import DFConv2d
 
 
+class NonLocalBlock(torch.nn.Module):
+    def __init__(self, cfg, in_channels):
+        super(NonLocalBlock, self).__init__()
+        self.bottleneck_channels = in_channels // 2
+        self.theta = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
+        self.phi = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
+        self.g = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
+
+        self.W = nn.Conv2d(self.bottleneck_channels, in_channels, kernel_size=1, stride=1)
+        self.bn = nn.BatchNorm2d(in_channels)
+
+    def forward(self, x):
+        batch = x.shape[0]
+        height = x.shape[2]
+        width = x.shape[3]
+
+        theta = self.theta(x)
+        theta = torch.reshape(theta, (-1, self.bottleneck_channels))
+
+        phi = self.phi(x)
+        phi = torch.reshape(phi, (self.bottleneck_channels, -1))
+
+        g = self.g(x)
+        g = torch.reshape(g, (-1, self.bottleneck_channels))
+
+        theta_phi = torch.matmul(theta, phi)
+        theta_phi = F.softmax(theta_phi, dim=1)
+
+        theta_phi_g = torch.matmul(theta_phi, g)
+        theta_phi_g = torch.reshape(theta_phi_g, (batch, -1, height, width))
+
+        w = self.W(theta_phi_g)
+        w = self.bn(w)
+        z = w + x
+
+        return z
+
+
 class FCOSHead(torch.nn.Module):
     def __init__(self, cfg, in_channels):
         """
@@ -23,6 +61,8 @@ class FCOSHead(torch.nn.Module):
         self.norm_reg_targets = cfg.MODEL.FCOS.NORM_REG_TARGETS
         self.centerness_on_reg = cfg.MODEL.FCOS.CENTERNESS_ON_REG
         self.use_dcn_in_tower = cfg.MODEL.FCOS.USE_DCN_IN_TOWER
+        self.non_local_on_cls = cfg.MODEL.FCOS.NON_LOCAL.ON_CLS
+        self.non_local_on_reg = cfg.MODEL.FCOS.NON_LOCAL.ON_REG
 
         cls_tower = []
         bbox_tower = []
@@ -88,14 +128,23 @@ class FCOSHead(torch.nn.Module):
         torch.nn.init.constant_(self.cls_logits.bias, bias_value)
 
         self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in range(5)])
+        self.non_local = NonLocalBlock(cfg, in_channels)
 
     def forward(self, x):
         logits = []
         bbox_reg = []
         centerness = []
         for l, feature in enumerate(x):
-            cls_tower = self.cls_tower(feature)
-            box_tower = self.bbox_tower(feature)
+            non_local_feature = self.non_local(feature)
+            if self.non_local_on_cls:
+                cls_tower = self.cls_tower(non_local_feature)
+            else:
+                cls_tower = self.cls_tower(feature)
+
+            if self.non_local_on_reg:
+                box_tower = self.bbox_tower(non_local_feature)
+            else:
+                box_tower = self.bbox_tower(feature)
 
             logits.append(self.cls_logits(cls_tower))
             if self.centerness_on_reg:
