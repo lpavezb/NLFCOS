@@ -11,6 +11,9 @@
 #include <iostream>
 #include <cmath>
 
+#ifndef AT_CHECK
+#define AT_CHECK TORCH_CHECK 
+#endif
 
 void deformable_im2col(const at::Tensor data_im, const at::Tensor data_offset,
                        const int channels, const int height, const int width,
