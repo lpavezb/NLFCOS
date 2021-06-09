@@ -61,8 +61,9 @@ class FCOSHead(torch.nn.Module):
         self.norm_reg_targets = cfg.MODEL.FCOS.NORM_REG_TARGETS
         self.centerness_on_reg = cfg.MODEL.FCOS.CENTERNESS_ON_REG
         self.use_dcn_in_tower = cfg.MODEL.FCOS.USE_DCN_IN_TOWER
-        self.non_local_on_cls = cfg.MODEL.FCOS.NON_LOCAL.ON_CLS
-        self.non_local_on_reg = cfg.MODEL.FCOS.NON_LOCAL.ON_REG
+        self.use_non_local = cfg.MODEL.FCOS.USE_NON_LOCAL
+        self.non_local_on_cls = cfg.MODEL.FCOS.NON_LOCAL.ON_CLS and self.use_non_local
+        self.non_local_on_reg = cfg.MODEL.FCOS.NON_LOCAL.ON_REG and self.use_non_local
 
         cls_tower = []
         bbox_tower = []
@@ -129,15 +130,20 @@ class FCOSHead(torch.nn.Module):
 
         self.scales = nn.ModuleList([Scale(init_value=1.0) for _ in range(5)])
 
-        if cfg.MODEL.FCOS.USE_NON_LOCAL:
+        if self.use_non_local:
             self.non_local = NonLocalBlock(cfg, in_channels)
+            for l in self.non_local.modules():
+                if isinstance(l, nn.Conv2d):
+                    torch.nn.init.normal_(l.weight, std=0.01)
+                    torch.nn.init.constant_(l.bias, 0)
 
     def forward(self, x):
         logits = []
         bbox_reg = []
         centerness = []
         for l, feature in enumerate(x):
-            non_local_feature = self.non_local(feature)
+            if self.use_non_local:
+                non_local_feature = self.non_local(feature)
             if self.non_local_on_cls:
                 cls_tower = self.cls_tower(non_local_feature)
             else:
