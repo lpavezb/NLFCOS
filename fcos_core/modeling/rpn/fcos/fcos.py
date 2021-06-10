@@ -13,13 +13,16 @@ from fcos_core.layers import DFConv2d
 class NonLocalBlock(torch.nn.Module):
     def __init__(self, cfg, in_channels):
         super(NonLocalBlock, self).__init__()
+        self.use_bn = cfg.MODEL.FCOS.NON_LOCAL.USE_BN
+
         self.bottleneck_channels = in_channels // 2
         self.theta = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
         self.phi = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
         self.g = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
 
         self.W = nn.Conv2d(self.bottleneck_channels, in_channels, kernel_size=1, stride=1)
-        self.bn = nn.BatchNorm2d(in_channels)
+        if self.use_bn:
+            self.bn = nn.BatchNorm2d(in_channels)
 
     def forward(self, x):
         batch = x.shape[0]
@@ -42,7 +45,8 @@ class NonLocalBlock(torch.nn.Module):
         theta_phi_g = torch.reshape(theta_phi_g, (batch, -1, height, width))
 
         w = self.W(theta_phi_g)
-        w = self.bn(w)
+        if self.use_bn:
+            w = self.bn(w)
         z = w + x
 
         return z
