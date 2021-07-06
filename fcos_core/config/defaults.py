@@ -106,6 +106,7 @@ _C.MODEL.BACKBONE.USE_GN = False
 _C.MODEL.FPN = CN()
 _C.MODEL.FPN.USE_GN = False
 _C.MODEL.FPN.USE_RELU = False
+_C.MODEL.FPN.USE_PANET = False
 
 
 # ---------------------------------------------------------------------------- #

@@ -12,7 +12,7 @@ class FPN(nn.Module):
     """
 
     def __init__(
-        self, in_channels_list, out_channels, conv_block, top_blocks=None
+        self, in_channels_list, out_channels, conv_block, top_blocks=None, use_panet=False
     ):
         """
         Arguments:
@@ -22,16 +22,31 @@ class FPN(nn.Module):
             top_blocks (nn.Module or None): if provided, an extra operation will
                 be performed on the output of the last (smallest resolution)
                 FPN output, and the result will extend the result list
+            use_panet (bool): if True, use panet architecture
         """
         super(FPN, self).__init__()
         self.inner_blocks = []
         self.layer_blocks = []
+        self.use_panet = use_panet
+
+        if use_panet:
+            self.panet_second_blocks = []
+            self.panet_down_blocks = []
         for idx, in_channels in enumerate(in_channels_list, 1):
             inner_block = "fpn_inner{}".format(idx)
             layer_block = "fpn_layer{}".format(idx)
 
             if in_channels == 0:
                 continue
+            if use_panet and idx > 2:
+                panet_down_block = "panet_layer{}".format(idx)
+                panet_second_block = "panet_inner{}".format(idx)
+                panet_down_block_module = conv_block(out_channels, out_channels, 3, 2)
+                panet_second_block_module = conv_block(out_channels, out_channels, 3, 1)
+                self.add_module(panet_down_block, panet_down_block_module)
+                self.add_module(panet_second_block, panet_second_block_module)
+                self.panet_down_blocks.append(panet_down_block)
+                self.panet_second_blocks.append(panet_second_block)
             inner_block_module = conv_block(in_channels, out_channels, 1)
             layer_block_module = conv_block(out_channels, out_channels, 3, 1)
             self.add_module(inner_block, inner_block_module)
@@ -64,6 +79,16 @@ class FPN(nn.Module):
             )
             last_inner = inner_lateral + inner_top_down
             results.insert(0, getattr(self, layer_block)(last_inner))
+
+        if self.use_panet:
+            panet_results = [results[0]]
+            last_n = results[0]  # N3 is P3, without any processing
+            for feature, down_block, second_block in zip(results[1:], self.panet_down_blocks, self.panet_second_blocks):
+                nx_tmp = getattr(self, down_block)(last_n)
+                nx_tmp = nx_tmp + feature
+                last_n = getattr(self, second_block)(nx_tmp)
+                panet_results.append(last_n)
+            results = panet_results
 
         if isinstance(self.top_blocks, LastLevelP6P7):
             last_results = self.top_blocks(x[-1], results[-1])
