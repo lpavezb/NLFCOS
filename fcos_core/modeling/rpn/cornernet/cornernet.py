@@ -1,7 +1,9 @@
 import math
-
+import os
 import torch
 import torch.nn.functional as F
+import numpy as np
+
 from torch import nn
 
 from .inference import make_cornernet_postprocessor, _tranpose_and_gather_feat
@@ -10,11 +12,64 @@ from .loss import make_cornernet_loss_evaluator
 INF = 100000000
 
 
+def get_num_gpus():
+    return int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
+
+
 def make_kp_layer(cnv_dim, curr_dim, out_dim):
     return nn.Sequential(
         Convolution(3, cnv_dim, curr_dim, with_bn=False),
         nn.Conv2d(curr_dim, out_dim, (1, 1))
     )
+
+
+def gaussian_radius(det_size, min_overlap):
+    height, width = det_size
+
+    a1  = 1
+    b1  = (height + width)
+    c1  = width * height * (1 - min_overlap) / (1 + min_overlap)
+    sq1 = np.sqrt(b1 ** 2 - 4 * a1 * c1)
+    r1  = (b1 - sq1) / (2 * a1)
+
+    a2  = 4
+    b2  = 2 * (height + width)
+    c2  = (1 - min_overlap) * width * height
+    sq2 = np.sqrt(b2 ** 2 - 4 * a2 * c2)
+    r2  = (b2 - sq2) / (2 * a2)
+
+    a3  = 4 * min_overlap
+    b3  = -2 * min_overlap * (height + width)
+    c3  = (min_overlap - 1) * width * height
+    sq3 = np.sqrt(b3 ** 2 - 4 * a3 * c3)
+    r3  = (b3 + sq3) / (2 * a3)
+    return min(r1, r2, r3)
+
+
+def gaussian2D(shape, sigma=1, device="cpu"):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m+1, -n:n+1]
+    y = torch.tensor(y, device=device)
+    x = torch.tensor(x, device=device)
+    h = torch.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    h[h < torch.finfo(h.dtype).eps * h.max()] = 0
+    return h
+
+
+def draw_gaussian(heatmap, center, radius, k=1):
+    diameter = 2 * radius + 1
+    gaussian = gaussian2D((diameter, diameter), sigma=diameter / 6, device=heatmap.device)
+
+    x, y = center
+
+    height, width = heatmap.shape[0:2]
+
+    left, right = min(x, radius), min(width - x, radius + 1)
+    top, bottom = min(y, radius), min(height - y, radius + 1)
+
+    masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
+    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
+    torch.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
 
 
 class Convolution(nn.Module):
@@ -36,7 +91,6 @@ class Convolution(nn.Module):
 class NonLocalBlock(torch.nn.Module):
     def __init__(self, cfg, in_channels):
         super(NonLocalBlock, self).__init__()
-        self.use_bn = cfg.MODEL.FCOS.NON_LOCAL.USE_BN
 
         self.bottleneck_channels = in_channels // 2
         self.theta = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
@@ -44,8 +98,6 @@ class NonLocalBlock(torch.nn.Module):
         self.g = nn.Conv2d(in_channels, self.bottleneck_channels, kernel_size=1, stride=1)
 
         self.W = nn.Conv2d(self.bottleneck_channels, in_channels, kernel_size=1, stride=1)
-        if self.use_bn:
-            self.bn = nn.BatchNorm2d(in_channels)
 
     def forward(self, x):
         batch = x.shape[0]
@@ -68,8 +120,6 @@ class NonLocalBlock(torch.nn.Module):
         theta_phi_g = torch.reshape(theta_phi_g, (batch, -1, height, width))
 
         w = self.W(theta_phi_g)
-        if self.use_bn:
-            w = self.bn(w)
         z = w + x
 
         return z
@@ -111,36 +161,33 @@ class CornerNetModule(torch.nn.Module):
         self.loss_evaluator = make_cornernet_loss_evaluator(cfg)
         self.box_selector = make_cornernet_postprocessor(cfg)
 
+        # initialization
+        for modules in [self.tl_nl, self.br_nl, self.tl_tags, self.br_tags, self.tl_regr, self.br_regr]:
+            for l in modules.modules():
+                if isinstance(l, nn.Conv2d):
+                    torch.nn.init.normal_(l.weight, std=0.01)
+                    torch.nn.init.constant_(l.bias, 0)
+
     def forward(self, images, features, targets=None):
         if self.training:
             return self.forward_train(features, targets)
         else:
             return self.forward_test(images.image_sizes, features)
 
-    def compute_tensrors_per_level(self, targets, shapes, device):
-        object_sizes_of_interest = [
-            [-1, 64],
-            [64, 128],
-            [128, 256],
-            [256, 512],
-            [512, INF],
-        ]
+    def compute_tensrors_per_level(self, targets, shape, device):
+        max_tag_len = 128
 
-        targets_per_level = []
-        for i, shape in enumerate(shapes):
-            max_tag_len = max(shape)
-            targets_per_level.append({
-                "tl_heatmaps": torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
-                                           device=device),
-                "br_heatmaps": torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
-                                           device=device),
-                "tl_regrs": torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device),
-                "br_regrs": torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device),
-                "tl_tags": torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device),
-                "br_tags": torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device),
-                "tag_masks": torch.zeros((self.batch_size, max_tag_len), dtype=torch.bool, device=device),
-                "tag_lens": torch.zeros((self.batch_size,), dtype=torch.int32, device=device)
-            })
+        tl_heatmaps = torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
+                                  device=device)
+        br_heatmaps = torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
+                                  device=device)
+        tl_regrs = torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device)
+        br_regrs = torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device)
+        tl_tags = torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device)
+        br_tags = torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device)
+        tag_masks = torch.zeros((self.batch_size, max_tag_len), dtype=torch.bool, device=device)
+        tag_lens = torch.zeros((self.batch_size,), dtype=torch.int32, device=device)
+
         for b_ind in range(self.batch_size):
             box_list = targets[b_ind]
             detections = box_list.bbox
@@ -151,16 +198,8 @@ class CornerNetModule(torch.nn.Module):
                 xtl, ytl = detection[0], detection[1]
                 xbr, ybr = detection[2], detection[3]
 
-                max_size = max((xbr - xtl), (ybr - ytl))
-                level = 0
-                for i, sizes in enumerate(object_sizes_of_interest):
-                    if max_size < sizes[1]:
-                        level = i
-                        break
-                level_tensors = targets_per_level[level]
-
-                width_ratio = shapes[level][1] / self.img_shape[1]
-                height_ratio = shapes[level][0] / self.img_shape[0]
+                width_ratio = shape[1] / self.img_shape[1]
+                height_ratio = shape[0] / self.img_shape[0]
 
                 fxtl = (xtl * width_ratio)
                 fytl = (ytl * height_ratio)
@@ -172,92 +211,67 @@ class CornerNetModule(torch.nn.Module):
                 xbr = int(fxbr)
                 ybr = int(fybr)
 
-                level_tensors["tl_heatmaps"][b_ind, category, ytl, xtl] = 1
-                level_tensors["br_heatmaps"][b_ind, category, ybr, xbr] = 1
-                tag_ind = level_tensors["tag_lens"][b_ind]
-                level_tensors["tl_regrs"][b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
-                level_tensors["br_regrs"][b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
-                level_tensors["tl_tags"][b_ind, tag_ind] = ytl * shapes[level][1] + xtl
-                level_tensors["br_tags"][b_ind, tag_ind] = ybr * shapes[level][1] + xbr
-                level_tensors["tag_lens"][b_ind] += 1
+                width = detection[2] - detection[0]
+                height = detection[3] - detection[1]
+
+                width = math.ceil(width * width_ratio)
+                height = math.ceil(height * height_ratio)
+                radius = gaussian_radius((height, width), 0.3)
+                radius = max(0, int(radius))
+
+                draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
+                draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
+
+                tag_ind = tag_lens[b_ind]
+                tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
+                br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
+                tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
+                br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
+                tag_lens[b_ind] += 1
+
         for b_ind in range(self.batch_size):
-            for level in range(len(shapes)):
-                level_tensors = targets_per_level[level]
-                tag_len = level_tensors["tag_lens"][b_ind]
-                level_tensors["tag_masks"][b_ind, :tag_len] = True
-        return targets_per_level
+            tag_len = tag_lens[b_ind]
+            tag_masks[b_ind, :tag_len] = True
+        return tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tl_tags, br_tags, tag_masks, tag_lens
 
     def forward_train(self, features, targets=None):
+        feature = features[2]
 
-        out_tl_heats = []
-        out_br_heats = []
-        out_tl_tags = []
-        out_br_tags = []
-        out_tl_regr = []
-        out_br_regr = []
+        tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tl_tags, br_tags, tag_masks, tag_lens = \
+            self.compute_tensrors_per_level(targets, feature.shape[2:], features[0].device)
 
-        shapes = []
-        stride = 8
-        for i in range(len(features)):
-            shapes.append([math.ceil(self.img_shape[0] / stride), math.ceil(self.img_shape[1] / stride)])
-            stride *= 2
-        targets_per_level = self.compute_tensrors_per_level(targets, shapes, features[0].device)
-        for level, feature in enumerate(features):
-            level_tensors = targets_per_level[level]
-            tl_nl = self.tl_nl(feature)
-            br_nl = self.br_nl(feature)
-            tl_tags = level_tensors["tl_tags"]
-            br_tags = level_tensors["br_tags"]
+        tl_nl = self.tl_nl(feature)
+        br_nl = self.br_nl(feature)
 
-            tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
-            tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
-            tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
+        tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
+        tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
+        tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
 
-            tl_tag = _tranpose_and_gather_feat(tl_tag, tl_tags)
-            br_tag = _tranpose_and_gather_feat(br_tag, br_tags)
-            tl_regr = _tranpose_and_gather_feat(tl_regr, tl_tags)
-            br_regr = _tranpose_and_gather_feat(br_regr, br_tags)
+        tl_tag = _tranpose_and_gather_feat(tl_tag, tl_tags)
+        br_tag = _tranpose_and_gather_feat(br_tag, br_tags)
+        tl_regr = _tranpose_and_gather_feat(tl_regr, tl_tags)
+        br_regr = _tranpose_and_gather_feat(br_regr, br_tags)
 
-            out_tl_heats.append(tl_heat)
-            out_br_heats.append(br_heat)
-            out_tl_tags.append(tl_tag)
-            out_br_tags.append(br_tag)
-            out_tl_regr.append(tl_regr)
-            out_br_regr.append(br_regr)
-        return self.evaluate_loss(out_tl_heats, out_br_heats, out_tl_tags,
-                                  out_br_tags, out_tl_regr, out_br_regr, targets_per_level)
+        out = [tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr]
+        computed_targets = [tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tag_masks]
+        return self.evaluate_loss(out, computed_targets)
 
     def forward_test(self, image_sizes, features):
-        out_tl_heats = []
-        out_br_heats = []
-        out_tl_tags = []
-        out_br_tags = []
-        out_tl_regr = []
-        out_br_regr = []
+        feature = features[2]
 
-        for feature in features:
-            tl_nl = self.tl_nl(feature)
-            br_nl = self.br_nl(feature)
+        tl_nl = self.tl_nl(feature)
+        br_nl = self.br_nl(feature)
 
-            tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
-            tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
-            tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
+        tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
+        tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
+        tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
 
-            out_tl_heats.append(tl_heat)
-            out_br_heats.append(br_heat)
-            out_tl_tags.append(tl_tag)
-            out_br_tags.append(br_tag)
-            out_tl_regr.append(tl_regr)
-            out_br_regr.append(br_regr)
-        return self.get_boxes(out_tl_heats, out_br_heats, out_tl_tags, out_br_tags,
-                              out_tl_regr, out_br_regr, image_sizes)
+        out = [tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr]
+        return self.get_boxes(out, image_sizes)
 
-    def evaluate_loss(self, out_tl_heats, out_br_heats, out_tl_tags,
-                      out_br_tags, out_tl_regr, out_br_regr, targets):
+    def evaluate_loss(self, out, computed_targets):
 
-        focal_loss, pull_loss, push_loss, regr_loss = self.loss_evaluator(out_tl_heats, out_br_heats, out_tl_tags,
-                                                                          out_br_tags, out_tl_regr, out_br_regr,
-                                                                          targets)
+        focal_loss, pull_loss, push_loss, regr_loss = self.loss_evaluator(out, computed_targets)
         losses = {
             "focal_loss": focal_loss,
             "pull_loss": pull_loss,
@@ -266,9 +280,8 @@ class CornerNetModule(torch.nn.Module):
         }
         return None, losses
 
-    def get_boxes(self, out_tl_heats, out_br_heats, out_tl_tags, out_br_tags, out_tl_regr, out_br_regr, image_sizes):
-        boxes = self.box_selector(out_tl_heats, out_br_heats, out_tl_tags, out_br_tags,
-                                  out_tl_regr, out_br_regr, image_sizes)
+    def get_boxes(self, out, image_sizes):
+        boxes = self.box_selector(out, image_sizes)
         return boxes, {}
 
 

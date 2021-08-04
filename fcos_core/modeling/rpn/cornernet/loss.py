@@ -33,31 +33,6 @@ def reduce_sum(tensor):
     return tensor
 
 
-def _neg_loss(preds, gt):
-    pos_inds = gt.eq(1)
-    neg_inds = gt.lt(1)
-
-    neg_weights = torch.pow(1 - gt[neg_inds], 4)
-
-    loss = 0
-    for pred in preds:
-        pos_pred = pred[pos_inds]
-        neg_pred = pred[neg_inds]
-
-        pos_loss = torch.log(pos_pred) * torch.pow(1 - pos_pred, 2)
-        neg_loss = torch.log(1 - neg_pred) * torch.pow(neg_pred, 2) * neg_weights
-
-        num_pos  = pos_inds.float().sum()
-        pos_loss = pos_loss.sum()
-        neg_loss = neg_loss.sum()
-
-        if pos_pred.nelement() == 0:
-            loss = loss - neg_loss
-        else:
-            loss = loss - (pos_loss + neg_loss) / num_pos
-    return loss
-
-
 class CornerNetLossComputation(object):
     """
     This class computes the FCOS losses.
@@ -134,7 +109,7 @@ class CornerNetLossComputation(object):
         regr_loss = regr_loss / (num + 1e-4)
         return regr_loss
 
-    def __call__(self, out_tl_heats, out_br_heats, out_tl_tags, out_br_tags, out_tl_regr, out_br_regr, targets):
+    def __call__(self, out, computed_targets):
         """
         Arguments:
             locations (list[BoxList])
@@ -153,44 +128,34 @@ class CornerNetLossComputation(object):
         push_loss = 0
         regr_loss = 0
 
-        for level in range(len(out_tl_heats)):
-            level_focal_loss = 0
-            level_pull_loss = 0
-            level_push_loss = 0
-            level_regr_loss = 0
+        tl_heat = out[0]
+        br_heat = out[1]
+        tl_tag = out[2]
+        br_tag = out[3]
+        tl_regr = out[4]
+        br_regr = out[5]
 
-            level_targets = targets[level]
-            gt_tl_heat = level_targets["tl_heatmaps"]
-            gt_br_heat = level_targets["br_heatmaps"]
-            gt_mask = level_targets["tag_masks"]
-            gt_tl_regr = level_targets["tl_regrs"]
-            gt_br_regr = level_targets["br_regrs"]
+        gt_tl_heat = computed_targets[0]
+        gt_br_heat = computed_targets[1]
+        gt_tl_regr = computed_targets[2]
+        gt_br_regr = computed_targets[3]
+        gt_mask = computed_targets[4]
 
-            tl_heats = self._sigmoid(out_tl_heats[level])
-            br_heats = self._sigmoid(out_br_heats[level])
+        tl_heats = self._sigmoid(tl_heat)
+        br_heats = self._sigmoid(br_heat)
 
-            level_focal_loss += self.focal_loss([tl_heats], gt_tl_heat)
-            level_focal_loss += self.focal_loss([br_heats], gt_br_heat)
+        focal_loss += self.focal_loss([tl_heats], gt_tl_heat)
+        focal_loss += self.focal_loss([br_heats], gt_br_heat)
 
-            tl_tag = out_tl_tags[level]
-            br_tag = out_br_tags[level]
+        pull, push = self.ae_loss(tl_tag, br_tag, gt_mask)
+        pull_loss += self.pull_weight * pull
+        push_loss += self.push_weight * push
 
-            pull, push = self.ae_loss(tl_tag, br_tag, gt_mask)
-            level_pull_loss += self.pull_weight * pull
-            level_push_loss += self.push_weight * push
+        regr_loss += self.regr_loss(tl_regr, gt_tl_regr, gt_mask)
+        regr_loss += self.regr_loss(br_regr, gt_br_regr, gt_mask)
 
-            tl_regr = out_tl_regr[level]
-            br_regr = out_br_regr[level]
+        regr_loss *= self.regr_weight
 
-            level_regr_loss += self.regr_loss(tl_regr, gt_tl_regr, gt_mask)
-            level_regr_loss += self.regr_loss(br_regr, gt_br_regr, gt_mask)
-
-            level_regr_loss *= self.regr_weight
-
-            focal_loss += level_focal_loss
-            pull_loss += level_pull_loss
-            push_loss += level_push_loss
-            regr_loss += level_regr_loss
         return focal_loss, pull_loss, push_loss, regr_loss
 
 
