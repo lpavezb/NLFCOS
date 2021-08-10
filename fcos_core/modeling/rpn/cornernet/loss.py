@@ -2,22 +2,13 @@
 This file contains specific functions for computing losses of CornerNet
 file
 """
+import os
 import math
 import torch
-from torch.nn import functional as F
+import numpy as np
+
 from torch import nn
-import os
-from ..utils import concat_box_prediction_layers
-
-from fcos_core.layers import IOULoss
-from fcos_core.layers import SigmoidFocalLoss
-from fcos_core.modeling.matcher import Matcher
-from fcos_core.modeling.utils import cat
-from fcos_core.structures.boxlist_ops import boxlist_iou
-from fcos_core.structures.boxlist_ops import cat_boxlist
-
-
-INF = 100000000
+from .inference import _tranpose_and_gather_feat
 
 
 def get_num_gpus():
@@ -33,6 +24,55 @@ def reduce_sum(tensor):
     return tensor
 
 
+def gaussian_radius(det_size, min_overlap):
+    height, width = det_size
+
+    a1  = 1
+    b1  = (height + width)
+    c1  = width * height * (1 - min_overlap) / (1 + min_overlap)
+    sq1 = np.sqrt(b1 ** 2 - 4 * a1 * c1)
+    r1  = (b1 - sq1) / (2 * a1)
+
+    a2  = 4
+    b2  = 2 * (height + width)
+    c2  = (1 - min_overlap) * width * height
+    sq2 = np.sqrt(b2 ** 2 - 4 * a2 * c2)
+    r2  = (b2 - sq2) / (2 * a2)
+
+    a3  = 4 * min_overlap
+    b3  = -2 * min_overlap * (height + width)
+    c3  = (min_overlap - 1) * width * height
+    sq3 = np.sqrt(b3 ** 2 - 4 * a3 * c3)
+    r3  = (b3 + sq3) / (2 * a3)
+    return min(r1, r2, r3)
+
+
+def gaussian2D(shape, sigma=1, device="cpu"):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m+1, -n:n+1]
+    y = torch.tensor(y, device=device)
+    x = torch.tensor(x, device=device)
+    h = torch.exp(-(x * x + y * y) / (2 * sigma * sigma))
+    h[h < torch.finfo(h.dtype).eps * h.max()] = 0
+    return h
+
+
+def draw_gaussian(heatmap, center, radius, k=1):
+    diameter = 2 * radius + 1
+    gaussian = gaussian2D((diameter, diameter), sigma=diameter / 6, device=heatmap.device)
+
+    x, y = center
+
+    height, width = heatmap.shape[0:2]
+
+    left, right = min(x, radius), min(width - x, radius + 1)
+    top, bottom = min(y, radius), min(height - y, radius + 1)
+
+    masked_heatmap = heatmap[y - top:y + bottom, x - left:x + right]
+    masked_gaussian = gaussian[radius - top:radius + bottom, radius - left:radius + right]
+    torch.maximum(masked_heatmap, masked_gaussian * k, out=masked_heatmap)
+
+
 class CornerNetLossComputation(object):
     """
     This class computes the FCOS losses.
@@ -42,6 +82,76 @@ class CornerNetLossComputation(object):
         self.pull_weight = 1e-1
         self.push_weight = 1e-1
         self.regr_weight = 1
+        self.batch_size = self.batch_size = cfg.SOLVER.IMS_PER_BATCH // get_num_gpus()
+
+        num_classes = cfg.MODEL.FCOS.NUM_CLASSES - 1
+        self.categories = num_classes
+
+        stride = cfg.DATALOADER.SIZE_DIVISIBILITY
+        img_shape = [cfg.INPUT.MAX_SIZE_TRAIN, cfg.INPUT.MIN_SIZE_TRAIN[0]]
+        img_shape[0] = int(math.ceil(img_shape[0] / stride) * stride)
+        img_shape[1] = int(math.ceil(img_shape[1] / stride) * stride)
+        self.img_shape = img_shape
+
+    def prepare_targets(self, targets, shape, device):
+        max_tag_len = 128
+
+        tl_heatmaps = torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
+                                  device=device)
+        br_heatmaps = torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
+                                  device=device)
+        tl_regrs = torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device)
+        br_regrs = torch.zeros((self.batch_size, max_tag_len, 2), dtype=torch.float32, device=device)
+        tl_tags = torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device)
+        br_tags = torch.zeros((self.batch_size, max_tag_len), dtype=torch.int64, device=device)
+        tag_masks = torch.zeros((self.batch_size, max_tag_len), dtype=torch.bool, device=device)
+        tag_lens = torch.zeros((self.batch_size,), dtype=torch.int32, device=device)
+
+        for b_ind in range(self.batch_size):
+            box_list = targets[b_ind]
+            detections = box_list.bbox
+            labels_per_detection = box_list.get_field("labels")
+            for ind, detection in enumerate(detections):
+                category = labels_per_detection[ind] - 1
+
+                xtl, ytl = detection[0], detection[1]
+                xbr, ybr = detection[2], detection[3]
+
+                width_ratio = shape[1] / self.img_shape[1]
+                height_ratio = shape[0] / self.img_shape[0]
+
+                fxtl = (xtl * width_ratio)
+                fytl = (ytl * height_ratio)
+                fxbr = (xbr * width_ratio)
+                fybr = (ybr * height_ratio)
+
+                xtl = int(fxtl)
+                ytl = int(fytl)
+                xbr = int(fxbr)
+                ybr = int(fybr)
+
+                width = detection[2] - detection[0]
+                height = detection[3] - detection[1]
+
+                width = math.ceil(width * width_ratio)
+                height = math.ceil(height * height_ratio)
+                radius = gaussian_radius((height, width), 0.3)
+                radius = max(0, int(radius))
+
+                draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
+                draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
+
+                tag_ind = tag_lens[b_ind]
+                tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
+                br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
+                tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
+                br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
+                tag_lens[b_ind] += 1
+
+        for b_ind in range(self.batch_size):
+            tag_len = tag_lens[b_ind]
+            tag_masks[b_ind, :tag_len] = True
+        return tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tl_tags, br_tags, tag_masks
 
     def _sigmoid(self, x):
         x = torch.clamp(x.sigmoid_(), min=1e-4, max=1 - 1e-4)
@@ -109,7 +219,7 @@ class CornerNetLossComputation(object):
         regr_loss = regr_loss / (num + 1e-4)
         return regr_loss
 
-    def __call__(self, out, computed_targets):
+    def __call__(self, out, targets):
         """
         Arguments:
             locations (list[BoxList])
@@ -135,11 +245,20 @@ class CornerNetLossComputation(object):
         tl_regr = out[4]
         br_regr = out[5]
 
+        # tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tl_tags, br_tags, tag_masks
+        computed_targets = self.prepare_targets(targets, tl_heat.shape[2:], tl_heat.device)
         gt_tl_heat = computed_targets[0]
         gt_br_heat = computed_targets[1]
         gt_tl_regr = computed_targets[2]
         gt_br_regr = computed_targets[3]
-        gt_mask = computed_targets[4]
+        gt_tl_tags = computed_targets[4]
+        gt_br_tags = computed_targets[5]
+        gt_mask = computed_targets[6]
+
+        tl_tag = _tranpose_and_gather_feat(tl_tag, gt_tl_tags)
+        br_tag = _tranpose_and_gather_feat(br_tag, gt_br_tags)
+        tl_regr = _tranpose_and_gather_feat(tl_regr, gt_tl_tags)
+        br_regr = _tranpose_and_gather_feat(br_regr, gt_br_tags)
 
         tl_heats = self._sigmoid(tl_heat)
         br_heats = self._sigmoid(br_heat)

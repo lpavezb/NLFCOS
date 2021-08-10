@@ -54,6 +54,10 @@ def build_resnet_fpn_p3p7_backbone(cfg):
     out_channels = cfg.MODEL.RESNETS.BACKBONE_OUT_CHANNELS
     in_channels_p6p7 = in_channels_stage2 * 8 if cfg.MODEL.RETINANET.USE_C5 \
         else out_channels
+    if cfg.MODEL.CORNERNET_ON:
+        top_blocks = None
+    else:
+        top_blocks = fpn_module.LastLevelP6P7(in_channels_p6p7, out_channels)
     fpn = fpn_module.FPN(
         in_channels_list=[
             0,
@@ -65,7 +69,7 @@ def build_resnet_fpn_p3p7_backbone(cfg):
         conv_block=conv_with_kaiming_uniform(
             cfg.MODEL.FPN.USE_GN, cfg.MODEL.FPN.USE_RELU
         ),
-        top_blocks=fpn_module.LastLevelP6P7(in_channels_p6p7, out_channels),
+        top_blocks=top_blocks,
         use_panet=cfg.MODEL.FPN.USE_PANET,
     )
     model = nn.Sequential(OrderedDict([("body", body), ("fpn", fpn)]))
