@@ -10,6 +10,8 @@ import numpy as np
 from torch import nn
 from .inference import _tranpose_and_gather_feat
 
+INF = 100000000
+
 
 def get_num_gpus():
     return int(os.environ["WORLD_SIZE"]) if "WORLD_SIZE" in os.environ else 1
@@ -93,7 +95,7 @@ class CornerNetLossComputation(object):
         img_shape[1] = int(math.ceil(img_shape[1] / stride) * stride)
         self.img_shape = img_shape
 
-    def prepare_targets(self, targets, shape, device):
+    def prepare_targets(self, targets, shape, device, object_sizes_of_interest):
         max_tag_len = 128
 
         tl_heatmaps = torch.zeros((self.batch_size, self.categories, shape[0], shape[1]), dtype=torch.float32,
@@ -117,36 +119,38 @@ class CornerNetLossComputation(object):
                 xtl, ytl = detection[0], detection[1]
                 xbr, ybr = detection[2], detection[3]
 
-                width_ratio = shape[1] / self.img_shape[1]
-                height_ratio = shape[0] / self.img_shape[0]
+                max_size = max((xbr - xtl), (ybr - ytl))
+                if object_sizes_of_interest[0] <= max_size <= object_sizes_of_interest[1]:
+                    width_ratio = shape[1] / self.img_shape[1]
+                    height_ratio = shape[0] / self.img_shape[0]
 
-                fxtl = (xtl * width_ratio)
-                fytl = (ytl * height_ratio)
-                fxbr = (xbr * width_ratio)
-                fybr = (ybr * height_ratio)
+                    fxtl = (xtl * width_ratio)
+                    fytl = (ytl * height_ratio)
+                    fxbr = (xbr * width_ratio)
+                    fybr = (ybr * height_ratio)
 
-                xtl = int(fxtl)
-                ytl = int(fytl)
-                xbr = int(fxbr)
-                ybr = int(fybr)
+                    xtl = int(fxtl)
+                    ytl = int(fytl)
+                    xbr = int(fxbr)
+                    ybr = int(fybr)
 
-                width = detection[2] - detection[0]
-                height = detection[3] - detection[1]
+                    width = detection[2] - detection[0]
+                    height = detection[3] - detection[1]
 
-                width = math.ceil(width * width_ratio)
-                height = math.ceil(height * height_ratio)
-                radius = gaussian_radius((height, width), 0.3)
-                radius = max(0, int(radius))
+                    width = math.ceil(width * width_ratio)
+                    height = math.ceil(height * height_ratio)
+                    radius = gaussian_radius((height, width), 0.3)
+                    radius = max(0, int(radius))
 
-                draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
-                draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
+                    draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
+                    draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
 
-                tag_ind = tag_lens[b_ind]
-                tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
-                br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
-                tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
-                br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
-                tag_lens[b_ind] += 1
+                    tag_ind = tag_lens[b_ind]
+                    tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
+                    br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
+                    tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
+                    br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
+                    tag_lens[b_ind] += 1
 
         for b_ind in range(self.batch_size):
             tag_len = tag_lens[b_ind]
@@ -219,7 +223,7 @@ class CornerNetLossComputation(object):
         regr_loss = regr_loss / (num + 1e-4)
         return regr_loss
 
-    def __call__(self, out, targets):
+    def __call__(self, outs, targets, shapes):
         """
         Arguments:
             locations (list[BoxList])
@@ -233,47 +237,68 @@ class CornerNetLossComputation(object):
             reg_loss (Tensor)
             centerness_loss (Tensor)
         """
+        object_sizes_of_interest = [
+            [-1, 64],
+            [64, 128],
+            [128, 256],
+            [256, 512],
+            [512, INF],
+        ]
         focal_loss = 0
         pull_loss = 0
         push_loss = 0
         regr_loss = 0
 
-        tl_heat = out[0]
-        br_heat = out[1]
-        tl_tag = out[2]
-        br_tag = out[3]
-        tl_regr = out[4]
-        br_regr = out[5]
+        for level in range(len(outs)):
+            level_focal_loss = 0
+            level_pull_loss = 0
+            level_push_loss = 0
+            level_regr_loss = 0
 
-        # tl_heatmaps, br_heatmaps, tl_regrs, br_regrs, tl_tags, br_tags, tag_masks
-        computed_targets = self.prepare_targets(targets, tl_heat.shape[2:], tl_heat.device)
-        gt_tl_heat = computed_targets[0]
-        gt_br_heat = computed_targets[1]
-        gt_tl_regr = computed_targets[2]
-        gt_br_regr = computed_targets[3]
-        gt_tl_tags = computed_targets[4]
-        gt_br_tags = computed_targets[5]
-        gt_mask = computed_targets[6]
+            out = outs[level]
+            tl_heat = out[0]
+            br_heat = out[1]
+            tl_tag = out[2]
+            br_tag = out[3]
+            tl_regr = out[4]
+            br_regr = out[5]
 
-        tl_tag = _tranpose_and_gather_feat(tl_tag, gt_tl_tags)
-        br_tag = _tranpose_and_gather_feat(br_tag, gt_br_tags)
-        tl_regr = _tranpose_and_gather_feat(tl_regr, gt_tl_tags)
-        br_regr = _tranpose_and_gather_feat(br_regr, gt_br_tags)
+            computed_targets = self.prepare_targets(targets, shapes[level], tl_heat.device,
+                                                    object_sizes_of_interest[level])
+            gt_tl_heat = computed_targets[0]
+            gt_br_heat = computed_targets[1]
+            gt_tl_regr = computed_targets[2]
+            gt_br_regr = computed_targets[3]
+            gt_tl_tags = computed_targets[4]
+            gt_br_tags = computed_targets[5]
+            gt_mask = computed_targets[6]
 
-        tl_heats = self._sigmoid(tl_heat)
-        br_heats = self._sigmoid(br_heat)
+            tl_tag = _tranpose_and_gather_feat(tl_tag, gt_tl_tags)
+            br_tag = _tranpose_and_gather_feat(br_tag, gt_br_tags)
+            tl_regr = _tranpose_and_gather_feat(tl_regr, gt_tl_tags)
+            br_regr = _tranpose_and_gather_feat(br_regr, gt_br_tags)
 
-        focal_loss += self.focal_loss([tl_heats], gt_tl_heat)
-        focal_loss += self.focal_loss([br_heats], gt_br_heat)
+            tl_heats = self._sigmoid(tl_heat)
+            br_heats = self._sigmoid(br_heat)
 
-        pull, push = self.ae_loss(tl_tag, br_tag, gt_mask)
-        pull_loss += self.pull_weight * pull
-        push_loss += self.push_weight * push
+            level_focal_loss += self.focal_loss([tl_heats], gt_tl_heat)
+            level_focal_loss += self.focal_loss([br_heats], gt_br_heat)
 
-        regr_loss += self.regr_loss(tl_regr, gt_tl_regr, gt_mask)
-        regr_loss += self.regr_loss(br_regr, gt_br_regr, gt_mask)
+            focal_loss += level_focal_loss
 
-        regr_loss *= self.regr_weight
+            pull, push = self.ae_loss(tl_tag, br_tag, gt_mask)
+            level_pull_loss += self.pull_weight * pull
+            level_push_loss += self.push_weight * push
+
+            pull_loss += level_pull_loss
+            push_loss += level_push_loss
+
+            level_regr_loss += self.regr_loss(tl_regr, gt_tl_regr, gt_mask)
+            level_regr_loss += self.regr_loss(br_regr, gt_br_regr, gt_mask)
+
+            level_regr_loss *= self.regr_weight
+
+            regr_loss += level_regr_loss
 
         return focal_loss, pull_loss, push_loss, regr_loss
 

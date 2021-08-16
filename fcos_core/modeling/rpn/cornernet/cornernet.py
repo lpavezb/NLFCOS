@@ -117,22 +117,25 @@ class CornerNetModule(torch.nn.Module):
                     torch.nn.init.constant_(l.bias, 0)
 
     def forward(self, images, features, targets=None):
-        tl_nl = self.tl_nl(features)
-        br_nl = self.br_nl(features)
+        outs = []
+        shapes = []
+        for feature in features:
+            shapes.append(feature.shape[2:])
+            tl_nl = self.tl_nl(feature)
+            br_nl = self.br_nl(feature)
 
-        tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
-        tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
-        tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
-
-        out = [tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr]
+            tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
+            tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
+            tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
+            outs.append([tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr])
         if self.training:
-            return self.evaluate_loss(out, targets)
+            return self.evaluate_loss(outs, targets, shapes)
         else:
-            return self.get_boxes(out, images.image_sizes)
+            return self.get_boxes(outs, images.image_sizes)
 
-    def evaluate_loss(self, out, computed_targets):
+    def evaluate_loss(self, out, computed_targets, shapes):
 
-        focal_loss, pull_loss, push_loss, regr_loss = self.loss_evaluator(out, computed_targets)
+        focal_loss, pull_loss, push_loss, regr_loss = self.loss_evaluator(out, computed_targets, shapes)
         losses = {
             "focal_loss": focal_loss,
             "pull_loss": pull_loss,

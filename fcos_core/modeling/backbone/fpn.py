@@ -97,8 +97,6 @@ class FPN(nn.Module):
             last_results = self.top_blocks(results[-1])
             results.extend(last_results)
 
-        if self.top_blocks is None:
-            return results[0]
         return tuple(results)
 
 
