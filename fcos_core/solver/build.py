@@ -22,7 +22,10 @@ def make_optimizer(cfg, model):
             lr *= cfg.SOLVER.DCONV_OFFSETS_LR_FACTOR
         params += [{"params": [value], "lr": lr, "weight_decay": weight_decay}]
 
-    optimizer = torch.optim.SGD(params, lr, momentum=cfg.SOLVER.MOMENTUM)
+    if cfg.SOLVER.OPTIMIZER == "adam":
+        optimizer = torch.optim.Adam(params, lr)
+    else:
+        optimizer = torch.optim.SGD(params, lr, momentum=cfg.SOLVER.MOMENTUM)
     return optimizer
 
 

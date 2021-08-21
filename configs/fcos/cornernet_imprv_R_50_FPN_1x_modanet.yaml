@@ -23,8 +23,9 @@ MODEL:
     # Please refer to https://github.com/yqyao/FCOS_PLUS
     CENTER_SAMPLING_RADIUS: 1.5
     IOU_LOSS_TYPE: "giou"
-    USE_NON_LOCAL: True
+    USE_NON_LOCAL: False
     NON_LOCAL:
+      USE_BN: False
       ON_CLS: True
       ON_REG: True
 DATASETS:
@@ -38,9 +39,10 @@ INPUT:
 DATALOADER:
   SIZE_DIVISIBILITY: 32
 SOLVER:
-  BASE_LR: 0.01
+  OPTIMIZER: "adam"
+  BASE_LR: 0.0002
   WEIGHT_DECAY: 0.0001
-  STEPS: (60000, 80000)
-  MAX_ITER: 90000
-  IMS_PER_BATCH: 4
+  STEPS: (450000, )
+  MAX_ITER: 500000
+  IMS_PER_BATCH: 8
   WARMUP_METHOD: "constant"
