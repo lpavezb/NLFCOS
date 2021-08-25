@@ -90,8 +90,12 @@ class CornerNetModule(torch.nn.Module):
         self.img_shape = img_shape
         self.batch_size = cfg.SOLVER.IMS_PER_BATCH // get_num_gpus()
 
-        self.tl_nl = NonLocalBlock(cfg, 256)
-        self.br_nl = NonLocalBlock(cfg, 256)
+        if cfg.MODEL.FCOS.USE_NON_LOCAL:
+            self.tl_nl = NonLocalBlock(cfg, 256)
+            self.br_nl = NonLocalBlock(cfg, 256)
+        else:
+            self.tl_nl = make_kp_layer(in_channels, in_channels, 256)
+            self.br_nl = make_kp_layer(in_channels, in_channels, 256)
         # keypoint heatmaps
         self.tl_heat = make_kp_layer(in_channels, in_channels, num_classes)
         self.br_heat = make_kp_layer(in_channels, in_channels, num_classes)
