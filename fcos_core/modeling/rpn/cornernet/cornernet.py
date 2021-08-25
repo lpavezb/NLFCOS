@@ -119,15 +119,15 @@ class CornerNetModule(torch.nn.Module):
     def forward(self, images, features, targets=None):
         outs = []
         shapes = []
-        for feature in features:
-            shapes.append(feature.shape[2:])
-            tl_nl = self.tl_nl(feature)
-            br_nl = self.br_nl(feature)
 
-            tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
-            tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
-            tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
-            outs.append([tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr])
+        shapes.append(features.shape[2:])
+        tl_nl = self.tl_nl(features)
+        br_nl = self.br_nl(features)
+
+        tl_heat, br_heat = self.tl_heat(tl_nl), self.br_heat(br_nl)
+        tl_tag, br_tag = self.tl_tags(tl_nl), self.br_tags(br_nl)
+        tl_regr, br_regr = self.tl_regr(tl_nl), self.br_regr(br_nl)
+        outs.append([tl_heat, br_heat, tl_tag, br_tag, tl_regr, br_regr])
         if self.training:
             return self.evaluate_loss(outs, targets, shapes)
         else:

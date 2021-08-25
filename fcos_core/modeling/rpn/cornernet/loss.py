@@ -119,38 +119,38 @@ class CornerNetLossComputation(object):
                 xtl, ytl = detection[0], detection[1]
                 xbr, ybr = detection[2], detection[3]
 
-                max_size = max((xbr - xtl), (ybr - ytl))
-                if object_sizes_of_interest[0] <= max_size <= object_sizes_of_interest[1]:
-                    width_ratio = shape[1] / self.img_shape[1]
-                    height_ratio = shape[0] / self.img_shape[0]
 
-                    fxtl = (xtl * width_ratio)
-                    fytl = (ytl * height_ratio)
-                    fxbr = (xbr * width_ratio)
-                    fybr = (ybr * height_ratio)
 
-                    xtl = int(fxtl)
-                    ytl = int(fytl)
-                    xbr = int(fxbr)
-                    ybr = int(fybr)
+                width_ratio = shape[1] / self.img_shape[1]
+                height_ratio = shape[0] / self.img_shape[0]
 
-                    width = detection[2] - detection[0]
-                    height = detection[3] - detection[1]
+                fxtl = (xtl * width_ratio)
+                fytl = (ytl * height_ratio)
+                fxbr = (xbr * width_ratio)
+                fybr = (ybr * height_ratio)
 
-                    width = math.ceil(width * width_ratio)
-                    height = math.ceil(height * height_ratio)
-                    radius = gaussian_radius((height, width), 0.3)
-                    radius = max(0, int(radius))
+                xtl = int(fxtl)
+                ytl = int(fytl)
+                xbr = int(fxbr)
+                ybr = int(fybr)
 
-                    draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
-                    draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
+                width = detection[2] - detection[0]
+                height = detection[3] - detection[1]
 
-                    tag_ind = tag_lens[b_ind]
-                    tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
-                    br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
-                    tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
-                    br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
-                    tag_lens[b_ind] += 1
+                width = math.ceil(width * width_ratio)
+                height = math.ceil(height * height_ratio)
+                radius = gaussian_radius((height, width), 0.3)
+                radius = max(0, int(radius))
+
+                draw_gaussian(tl_heatmaps[b_ind, category], [xtl, ytl], radius)
+                draw_gaussian(br_heatmaps[b_ind, category], [xbr, ybr], radius)
+
+                tag_ind = tag_lens[b_ind]
+                tl_regrs[b_ind, tag_ind, :] = torch.tensor([fxtl - xtl, fytl - ytl])
+                br_regrs[b_ind, tag_ind, :] = torch.tensor([fxbr - xbr, fybr - ybr])
+                tl_tags[b_ind, tag_ind] = ytl * shape[1] + xtl
+                br_tags[b_ind, tag_ind] = ybr * shape[1] + xbr
+                tag_lens[b_ind] += 1
 
         for b_ind in range(self.batch_size):
             tag_len = tag_lens[b_ind]
